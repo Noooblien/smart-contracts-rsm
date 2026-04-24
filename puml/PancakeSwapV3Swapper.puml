@@ -1,0 +1,172 @@
+@startuml PancakeSwapV3Swapper
+
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+
+skinparam class {
+  BackgroundColor #FFFFFF
+  BorderColor #4A4A8A
+  ArrowColor #4A4A8A
+  HeaderBackgroundColor #EEEDFE
+  HeaderFontColor #26215C
+  FontColor #2C2C2A
+}
+
+skinparam note {
+  BackgroundColor #FAEEDA
+  BorderColor #633806
+  FontColor #2C2C2A
+}
+
+skinparam package {
+  BackgroundColor #F1EFE8
+  BorderColor #888780
+  FontColor #2C2C2A
+}
+
+title PancakeSwapV3Swapper — Contract Architecture
+
+' ─── BASE CONTRACTS ───────────────────────────────────
+
+package "Base Contracts" {
+
+  abstract class ReentrancyGuard {
+    - _status : uint256 = 1
+    + {abstract} nonReentrant() : modifier
+  }
+
+  abstract class Pausable {
+    + paused : bool
+    + {abstract} whenNotPaused() : modifier
+    + {event} Paused(by: address)
+    + {event} Unpaused(by: address)
+  }
+
+}
+
+' ─── EXTERNAL INTERFACES ───────────────────────────────
+
+package "External Interfaces" {
+
+  interface IERC20 {
+    + approve(spender, amount) : bool
+    + transfer(to, amount) : bool
+    + transferFrom(from, to, amount) : bool
+    + balanceOf(account) : uint256
+  }
+
+  interface IPancakeV3Router {
+    + exactInputSingle(params) : uint256
+    + exactInput(params) : uint256
+    + exactOutputSingle(params) : uint256
+  }
+
+  interface IPancakeV3QuoterV2 {
+    + quoteExactInputSingle(tokenIn, tokenOut, amountIn, fee, sqrtPriceLimit) : uint256
+    + quoteExactInput(path, amountIn) : uint256
+  }
+
+}
+
+' ─── MAIN CONTRACT ────────────────────────────────────
+
+class PancakeSwapV3Swapper {
+
+  ' === CONSTANTS ===
+  + MAX_FEE_BPS : uint256 = 500
+  + BPS_DENOMINATOR : uint256 = 10_000
+
+  ' === IMMUTABLES ===
+  + router : address <<immutable>>
+  + quoter : address <<immutable>>
+
+  ' === STATE ===
+  + owner : address
+  + feeRecipient : address
+  + feeBps : uint256
+  + defaultDeadlineBuffer : uint256
+  + defaultSlippageBps : uint256
+  + paused : bool
+
+  ' === CONSTRUCTOR ===
+  + constructor(_router, _quoter, _feeRecipient, _feeBps)
+
+  ' === PUBLIC SWAPS ===
+  + swapSingleHop(tokenIn, tokenOut, fee, amountIn, recipient, deadline, slippageBps) : uint256
+  + swapMultiHop(path, tokenIn, amountIn, recipient, deadline, slippageBps) : uint256
+  + swapExactOutput(tokenIn, tokenOut, fee, amountOut, amountInMaximum, recipient, deadline) : uint256
+
+  ' === VIEW / QUOTE ===
+  + quoteSingleHop(tokenIn, tokenOut, fee, amountIn) : (uint256, uint256, uint256)
+  + quoteMultiHop(path, tokenIn, amountIn) : (uint256, uint256, uint256)
+
+  ' === OWNER: CIRCUIT BREAKER ===
+  + pause() <<onlyOwner>>
+  + unpause() <<onlyOwner>>
+
+  ' === OWNER: CONFIG ===
+  + setFee(newBps) <<onlyOwner>>
+  + setFeeRecipient(newAddr) <<onlyOwner>>
+  + setDeadlineBuffer(secs) <<onlyOwner>>
+  + setDefaultSlippage(bps) <<onlyOwner>>
+  + transferOwnership(newOwner) <<onlyOwner>>
+  + rescueTokens(token, amount) <<onlyOwner>>
+
+  ' === INTERNAL ===
+  - _resolveDeadline(dl) : uint256
+  - _calcFee(amount) : uint256
+  - _takeFee(token, grossAmount) : uint256
+  - _applySlippage(amount, slipBps) : uint256
+  - _approveRouter(token, amount)
+  - _quoteSingle(tokenIn, tokenOut, fee, amountIn) : uint256
+  - _quoteMultiHop(path, amountIn) : uint256
+  - _safeTransferFrom(token, from, to, amount)
+  - _safeTransfer(token, to, amount)
+
+}
+
+' ─── EVENTS ────────────────────────────────────────────
+
+class Events << (E,#E1F5EE) >> {
+  SwapExecuted(caller, tokenIn, tokenOut, amountIn, amountOut, feeCharged, recipient)
+  FeeUpdated(oldBps, newBps)
+  FeeRecipientUpdated(oldAddr, newAddr)
+  DeadlineBufferUpdated(oldVal, newVal)
+  SlippageUpdated(oldBps, newBps)
+  OwnershipTransferred(oldOwner, newOwner)
+  Paused(by)
+  Unpaused(by)
+  TokensRescued(token, amount)
+}
+
+' ─── CUSTOM ERRORS ─────────────────────────────────────
+
+class CustomErrors << (X,#FAECE7) >> {
+  NotOwner()
+  ZeroAddress()
+  ZeroAmount()
+  FeeTooHigh()
+  DeadlineExpired()
+  ContractPaused()
+  InvalidPath()
+  TransferFailed()
+}
+
+' ─── INHERITANCE ───────────────────────────────────────
+
+PancakeSwapV3Swapper --|> ReentrancyGuard
+PancakeSwapV3Swapper --|> Pausable
+
+' ─── DEPENDENCIES ──────────────────────────────────────
+
+PancakeSwapV3Swapper ..> IERC20 : uses
+PancakeSwapV3Swapper ..> IPancakeV3Router : calls
+PancakeSwapV3Swapper ..> IPancakeV3QuoterV2 : quotes
+
+' ─── EVENTS / ERRORS ───────────────────────────────────
+
+PancakeSwapV3Swapper ..> Events : emits
+PancakeSwapV3Swapper ..> CustomErrors : reverts
+
+@enduml

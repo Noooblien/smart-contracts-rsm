@@ -1,0 +1,100 @@
+@startuml SwapFlow
+
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+
+skinparam participant {
+  BackgroundColor #EEEDFE
+  BorderColor #4A4A8A
+  FontColor #26215C
+}
+
+skinparam sequence {
+  ArrowColor #4A4A8A
+  LifeLineBorderColor #888780
+  LifeLineBackgroundColor #F1EFE8
+  DividerBackgroundColor #FAEEDA
+  DividerBorderColor #633806
+  GroupBackgroundColor #E1F5EE
+  GroupBorderColor #0F6E56
+  NoteBackgroundColor #FAEEDA
+  NoteBorderColor #633806
+}
+
+title PancakeSwapV3Swapper — Swap Execution Flow (swapSingleHop)
+
+actor       Caller
+participant "PancakeSwapV3Swapper" as Contract
+participant "ERC-20 TokenIn"       as TokenIn
+participant "ERC-20 TokenOut"      as TokenOut
+participant "QuoterV2"             as Quoter
+participant "V3 Router"            as Router
+participant "V3 Pool"              as Pool
+participant "feeRecipient"         as FeeWallet
+
+== Pre-conditions ==
+
+Caller -> TokenIn : approve(Contract, amountIn)
+note right : Caller must approve\nbefore calling swap
+
+== swapSingleHop() ==
+
+Caller -> Contract : swapSingleHop(\n  tokenIn, tokenOut, fee,\n  amountIn, recipient,\n  deadline, slippageBps\n)
+
+group Safety Checks
+  Contract -> Contract : nonReentrant lock (_status = 2)
+  Contract -> Contract : whenNotPaused check
+  Contract -> Contract : amountIn != 0
+  Contract -> Contract : recipient != address(0)
+  Contract -> Contract : resolveDeadline(deadline)
+end
+
+group Pull Tokens
+  Contract -> TokenIn : transferFrom(caller, Contract, amountIn)
+  TokenIn --> Contract : tokens received\n(balance-delta verified)
+end
+
+group Protocol Fee
+  Contract -> Contract : feeAmt = amountIn × feeBps / 10000
+  Contract -> TokenIn : transfer(feeRecipient, feeAmt)
+  TokenIn --> FeeWallet : fee arrives
+  note right of FeeWallet : Fee taken in tokenIn\nbefore the swap
+end
+
+group Auto-Slippage via QuoterV2
+  Contract -> Quoter : quoteExactInputSingle(\n  tokenIn, tokenOut,\n  fee, netIn\n)
+  Quoter -> Pool : simulate swap
+  Pool --> Quoter : expectedOut
+  Quoter --> Contract : expectedOut
+  Contract -> Contract : minOut = expectedOut ×\n(10000 - slippageBps) / 10000
+end
+
+group Execute Swap
+  Contract -> TokenIn : approve(router, 0)\n  approve(router, netIn)
+  note right : USDT-safe double approve
+  Contract -> Router : exactInputSingle(\n  tokenIn, tokenOut, fee,\n  recipient, deadline,\n  netIn, minOut\n)
+  Router -> Pool : execute swap
+  Pool -> TokenOut : transfer(recipient, amountOut)
+  Pool --> Router : amountOut
+  Router --> Contract : amountOut
+end
+
+group Cleanup
+  Contract -> Contract : nonReentrant unlock (_status = 1)
+  Contract -> Contract : emit SwapExecuted(...)
+end
+
+Contract --> Caller : amountOut
+
+== Result ==
+
+note over Caller, Pool
+  Caller spent: amountIn (tokenIn)
+  Fee received by feeRecipient: feeAmt (tokenIn)
+  Router swapped: netIn = amountIn - feeAmt
+  Recipient received: amountOut (tokenOut) ≥ minOut
+end note
+
+@enduml
