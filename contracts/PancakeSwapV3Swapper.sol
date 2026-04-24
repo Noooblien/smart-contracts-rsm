@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 /*
-  PancakeSwapV3Swapper 
+  PancakeSwapV3Swapper
   ─────────────────────────────────────────────────────────────────
   BSC Mainnet Router : 0x13f4EA83D0bd40E75C8222255bc855a974568Dd4
   BSC Mainnet Quoter : 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
@@ -100,22 +100,25 @@ abstract contract ReentrancyGuard {
 
 contract PancakeSwapV3Swapper is ReentrancyGuard {
 
-    // ── Constants ──────────────────────────────────────────────────
-    uint256 public constant MAX_FEE_BPS         = 500;     // 5% hard ceiling on protocol fee
-    uint256 public constant BPS_DENOMINATOR     = 10_000;
-    uint256 public constant FEE_TIMELOCK        = 2 days;  // fee & feeRecipient change delay
-    uint256 public constant MAX_DEADLINE_BUFFER = 1 hours; // [LOW-3] cap on deadline buffer
-    uint256 public constant RESCUE_DELAY        = 1 days;  // [HIGH-1] rescue timelock per token
+    // ── Constants ────────────────────────────────────────────────────
+    uint256 public constant MAX_FEE_BPS          = 500;      // 5%  — protocol fee ceiling
+    uint256 public constant BPS_DENOMINATOR      = 10_000;
+    uint256 public constant FEE_TIMELOCK         = 2 days;   // fee / feeRecipient change delay
+    uint256 public constant RESCUE_DELAY         = 3 days;   // FEE_TIMELOCK
+    uint256 public constant MAX_DEADLINE_BUFFER  = 1 hours;  // deadline buffer ceiling
+    uint256 public constant MIN_SLIPPAGE_BPS     = 1;        // 0.01% floor — must be nonzero
+    uint256 public constant INITIAL_DEADLINE_BUF = 300;      // 5 min — constructor default
+    uint256 public constant INITIAL_SLIPPAGE_BPS = 50;       // 0.5% — constructor default
 
-    // ── Immutables ─────────────────────────────────────────────────
+    // ── Immutables ───────────────────────────────────────────────────
     address public immutable router;
     address public immutable quoter;
 
-    // ── Ownership (two-step) ───────────────────────────────────────
+    // ── Ownership (two-step) ─────────────────────────────────────────
     address public owner;
     address public pendingOwner;
 
-    // ── Fee config ─────────────────────────────────────────────────
+    // ── Fee config ───────────────────────────────────────────────────
     address public feeRecipient;
     uint256 public feeBps;
 
@@ -124,28 +127,31 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     uint256 public feeChangeAvailableAt;
     bool    public hasPendingFeeChange;
 
-    // Pending feeRecipient change (timelock) [MEDIUM-2]
+    // Pending feeRecipient change (timelock)
     address public pendingFeeRecipient;
     uint256 public feeRecipientChangeAvailableAt;
     bool    public hasPendingFeeRecipientChange;
 
-    // ── Swap config ────────────────────────────────────────────────
+    // ── Swap config ──────────────────────────────────────────────────
     uint256 public defaultDeadlineBuffer;
     uint256 public defaultSlippageBps;
 
-    // ── Circuit breaker ────────────────────────────────────────────
+    // ── Circuit breaker ──────────────────────────────────────────────
     bool public paused;
 
-    // ── Rescue timelock state [HIGH-1] ─────────────────────────────
-    // token => earliest timestamp at which rescue is executable
+    // ── Rescue timelock state ────────────────────────────────────────
     mapping(address => uint256) public rescueAvailableAt;
     mapping(address => uint256) public rescueAmount;
     mapping(address => bool)    public hasPendingRescue;
 
-    // ── Events ─────────────────────────────────────────────────────
+    // ── Events ───────────────────────────────────────────────────────
+
+    // [INFO-1] includes router + quoter
     event Initialized(
         address indexed owner,
-        address indexed feeRecipient,
+        address indexed router,
+        address indexed quoter,
+        address feeRecipient,
         uint256 feeBps,
         uint256 defaultDeadlineBuffer,
         uint256 defaultSlippageBps
@@ -154,63 +160,70 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         address indexed caller,
         address indexed tokenIn,
         address indexed tokenOut,
-        uint256 grossAmountIn,   // total tokenIn pulled from caller (swap + fee)
+        uint256 grossAmountIn,  // actual non-refunded tokenIn cost (swap + fee)
         uint256 amountOut,
         uint256 feeCharged,
         address recipient
     );
-
     // Ownership
     event OwnershipTransferInitiated(address indexed current, address indexed pending);
-    event OwnershipTransferCancelled(address indexed cancelledFor);  // [MEDIUM-1,3]
+    event OwnershipTransferCancelled(address indexed cancelledFor);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
-
     // Fee
     event FeeChangeQueued(uint256 newBps, uint256 availableAt);
     event FeeChangeApplied(uint256 oldBps, uint256 newBps);
     event FeeChangeCancelled(uint256 cancelledBps);
-    event FeeRecipientChangeQueued(address newAddr, uint256 availableAt);  // [MEDIUM-2]
+    event FeeRecipientChangeQueued(address newAddr, uint256 availableAt);
     event FeeRecipientChangeApplied(address oldAddr, address newAddr);
     event FeeRecipientChangeCancelled(address cancelledAddr);
-
     // Config
     event DeadlineBufferUpdated(uint256 oldVal, uint256 newVal);
     event SlippageUpdated(uint256 oldBps, uint256 newBps);
+    // Circuit breaker
     event Paused(address indexed by);
     event Unpaused(address indexed by);
-
-    // Rescue
+    // Rescue — [LOW-1] amount included in cancelled event
     event RescueQueued(address indexed token, uint256 amount, uint256 availableAt);
     event RescueExecuted(address indexed token, uint256 amount);
-    event RescueCancelled(address indexed token);
+    event RescueCancelled(address indexed token, uint256 amount);
 
-    // ── Custom errors ──────────────────────────────────────────────
+    // ── Custom errors ────────────────────────────────────────────────
     error NotOwner();
     error NotPendingOwner();
-    error NoPendingTransfer();       // [MEDIUM-1]
+    error NoPendingTransfer();
     error ZeroAddress();
     error ZeroAmount();
     error FeeTooHigh();
     error DeadlineExpired();
-    error DeadlineBufferTooLarge();  // [LOW-3]
+    error DeadlineBufferTooLarge();
     error ContractPaused();
     error InvalidPath();
+    error MisalignedPath();           //  hop alignment
     error TransferFailed();
-    error ShortfallTooLarge();       // fee-on-transfer shortfall exceeds tolerance
     error SlippageNotSet();
+    error SlippageTooLow();
+    error FOTIncompatible();          //  FOT + exact-output incompatible
+    error InsufficientBalance();      //  rescue balance check
     error TimelockNotElapsed();
     error NoPendingFeeChange();
     error NoPendingFeeRecipientChange();
     error NoPendingRescue();
     error RouterAllowanceNotZero();
+    error ContractCallerNotAllowed(); //  quote called by contract
 
-    // ── Modifiers ──────────────────────────────────────────────────
+    // ── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
         _;
     }
     modifier whenNotPaused() {
         if (paused) revert ContractPaused();
+        _;
+    }
+    /// @dev Blocks contract callers from relying on QuoterV2 inside on-chain logic.
+    ///      This is not an eth_call detector: EOAs can still submit transactions.
+    modifier noContractCallers() {
+        if (msg.sender != tx.origin) revert ContractCallerNotAllowed();
         _;
     }
 
@@ -229,16 +242,22 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         if (_feeRecipient == address(0)) revert ZeroAddress();
         if (_feeBps > MAX_FEE_BPS)       revert FeeTooHigh();
 
+        if (INITIAL_SLIPPAGE_BPS < MIN_SLIPPAGE_BPS) revert SlippageTooLow();
+        if (INITIAL_DEADLINE_BUF > MAX_DEADLINE_BUFFER) revert DeadlineBufferTooLarge();
+
         router                = _router;
         quoter                = _quoter;
         feeRecipient          = _feeRecipient;
         feeBps                = _feeBps;
         owner                 = msg.sender;
-        defaultDeadlineBuffer = 300;   // 5 min
-        defaultSlippageBps    = 50;    // 0.5%
+        defaultDeadlineBuffer = INITIAL_DEADLINE_BUF;
+        defaultSlippageBps    = INITIAL_SLIPPAGE_BPS;
 
-        // [INFO-3] emit baseline state for indexers
-        emit Initialized(msg.sender, _feeRecipient, _feeBps, 300, 50);
+        emit Initialized(
+            msg.sender, _router, _quoter,
+            _feeRecipient, _feeBps,
+            INITIAL_DEADLINE_BUF, INITIAL_SLIPPAGE_BPS
+        );
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -246,21 +265,20 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * @notice Sell exactly `amountIn` of tokenIn, receive as much tokenOut as possible.
+     * @notice Sell exactly `amountIn` of tokenIn for as much tokenOut as possible.
      *
-     * @dev IMPORTANT — fee and slippage are coupled:
-     *      The protocol fee is deducted from amountIn before the swap.
-     *      amountOutMinimum must be computed against (amountIn - fee), not amountIn.
-     *      Use quoteSingleHop() via eth_call with the same amountIn to get the correct
-     *      minOut value. Passing a minOut computed on gross amountIn will cause reverts.
+     * @dev Fee + slippage coupling: the protocol fee is deducted from amountIn
+     *      before the swap. `amountOutMinimum` must be computed against netIn
+     *      (amountIn minus fee), not gross amountIn. Use quoteSingleHop() via
+     *      eth_call to get the correct value.
      *
      * @param tokenIn          ERC-20 to sell
      * @param tokenOut         ERC-20 to receive
-     * @param fee              Pool fee tier: 100 | 500 | 2500 | 10000
-     * @param amountIn         Gross tokenIn amount — protocol fee is deducted from this
-     * @param amountOutMinimum Minimum tokenOut — MUST be computed via quoteSingleHop() off-chain
+     * @param fee              Pool tier: 100 | 500 | 2500 | 10000
+     * @param amountIn         Gross amount — fee deducted internally
+     * @param amountOutMinimum Slippage guard — compute via quoteSingleHop() off-chain
      * @param recipient        Receives tokenOut
-     * @param deadline         Unix timestamp; 0 = block.timestamp + defaultDeadlineBuffer
+     * @param deadline         Unix ts; 0 = block.timestamp + defaultDeadlineBuffer
      */
     function swapSingleHop(
         address tokenIn,
@@ -276,7 +294,6 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         if (recipient == address(0)) revert ZeroAddress();
 
         uint256 dl = _resolveDeadline(deadline);
-
         uint256 received = _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
         uint256 feeAmt   = _calcFee(received);
         uint256 netIn    = received - feeAmt;
@@ -298,27 +315,26 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         );
 
         _resetRouterAllowance(tokenIn);
-
-        // grossAmountIn = received (actual pulled, may differ from amountIn for FOT tokens)
         emit SwapExecuted(msg.sender, tokenIn, tokenOut, received, amountOut, feeAmt, recipient);
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  SWAP 2: EXACT INPUT — MULTI HOP  (A → mid → ... → B)
+    //  SWAP 2: EXACT INPUT — MULTI HOP  (A → ... → B)
     // ══════════════════════════════════════════════════════════════
 
     /**
      * @notice Swap through multiple pools in sequence.
      *
-     * @dev IMPORTANT — fee and slippage are coupled (same as swapSingleHop).
-     *      Use quoteMultiHop() off-chain to compute amountOutMinimum.
+     * @dev Path encoding: abi.encodePacked(tokenA, fee1, tokenMid, fee2, tokenB)
+     *      Minimum length 66 bytes (two hops: 20+3+20+3+20).
+     *      Each additional hop adds 23 bytes (fee(3) + addr(20)).
+     *      [MEDIUM-2] Path must satisfy: (path.length - 20) % 23 == 0
      *
-     * @param path             abi.encodePacked(tokenA, fee1, tokenMid, fee2, tokenB, ...)
-     *                         Minimum 66 bytes (two hops). Each additional hop adds 23 bytes.
-     * @param tokenIn          First token in path (pulled from caller)
-     * @param amountIn         Gross tokenIn — fee deducted before swap
-     * @param amountOutMinimum Minimum final token — MUST be computed via quoteMultiHop() off-chain
-     * @param recipient        Receives the final token in path
+     * @param path             Packed swap path — minimum 66 bytes, hop-aligned
+     * @param tokenIn          First token in path
+     * @param amountIn         Gross amount — fee deducted internally
+     * @param amountOutMinimum Slippage guard — compute via quoteMultiHop() off-chain
+     * @param recipient        Receives the last token in path
      * @param deadline         0 = use default
      */
     function swapMultiHop(
@@ -332,11 +348,15 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         if (amountIn == 0)           revert ZeroAmount();
         if (amountOutMinimum == 0)   revert SlippageNotSet();
         if (recipient == address(0)) revert ZeroAddress();
-        // [MEDIUM-4] true multi-hop minimum: addr(20)+fee(3)+addr(20)+fee(3)+addr(20) = 66
+        // [MEDIUM-4 from v3] minimum two-hop = 66 bytes
         if (path.length < 66)        revert InvalidPath();
+        // [MEDIUM-2] every hop segment is exactly 23 bytes (addr20 + fee3)
+        // total path = 20 (first addr) + N*23 (each hop). So (len-20) % 23 must be 0.
+        if ((path.length - 20) % 23 != 0) revert MisalignedPath();
 
         uint256 dl       = _resolveDeadline(deadline);
-        address tokenOut = _decodeTokenOut(path); // [LOW-1] pure-Solidity decode
+        // [CRITICAL] spec-compliant decode — no abi.decode undefined behavior
+        address tokenOut = address(bytes20(path[path.length - 20 :]));
 
         uint256 received = _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
         uint256 feeAmt   = _calcFee(received);
@@ -356,7 +376,6 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         );
 
         _resetRouterAllowance(tokenIn);
-
         emit SwapExecuted(msg.sender, tokenIn, tokenOut, received, amountOut, feeAmt, recipient);
     }
 
@@ -365,23 +384,26 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * @notice Receive exactly `amountOut` of tokenOut.
-     *         Spends ≤ amountInMaximum of tokenIn (net of fee); refunds the rest.
+     * @notice Receive exactly `amountOut` of tokenOut. Refunds unspent tokenIn.
      *
-     * @dev Fee model for exact-output:
-     *      - The protocol fee is computed on amountInMaximum upfront.
-     *      - Caller must send grossMaximum = amountInMaximum + fee (use quoteExactOutputBudget()).
-     *      - Fee is taken before the router call; router only ever sees amountInMaximum.
-     *      - amountInMaximum IS the slippage control — set it tightly (e.g. quote * 1.005).
+     * @dev Slippage control: `amountInMaximum` is your slippage guard. Set it to
+     *      (quoted amountIn) * 1.005 for 0.5% tolerance. The router enforces it
+     *      as a hard cap — if the price moves beyond it, the tx reverts.
+     *      This value is tokenIn-denominated, so it should be chosen from a
+     *      quote plus tolerance, not compared numerically against amountOut.
      *
-     * @dev [CRITICAL-1 FIX] feeOnMax is computed once and reused — no double-fee.
-     *      [CRITICAL-2] amountInMaximum enforced by router as hard cap.
+     * @dev FOT tokens: exact-output is incompatible with fee-on-transfer tokens
+     *      because the fee reduces netMax below amountOut. Use swapSingleHop instead.
+     *      [HIGH-3] This is detected and reverts FOTIncompatible().
+     *
+     * @dev Fee model: caller must send grossMaximum = amountInMaximum + fee.
+     *      Use quoteExactOutputBudget() to get the correct grossMaximum.
      *
      * @param tokenIn          Token to sell
-     * @param tokenOut         Token to buy
-     * @param fee              Pool fee tier
-     * @param amountOut        Exact tokenOut to receive
-     * @param amountInMaximum  Max tokenIn the router may spend — this is your slippage control
+     * @param tokenOut         Token to buy (received exactly)
+     * @param fee              Pool tier
+     * @param amountOut        Exact tokenOut desired
+     * @param amountInMaximum  Max tokenIn router may spend — your slippage bound
      * @param recipient        Receives tokenOut
      * @param deadline         0 = use default
      */
@@ -394,23 +416,26 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         address recipient,
         uint256 deadline
     ) external nonReentrant whenNotPaused returns (uint256 amountIn) {
-        if (amountOut == 0)          revert ZeroAmount();
-        if (amountInMaximum == 0)    revert ZeroAmount();
-        if (recipient == address(0)) revert ZeroAddress();
+        if (amountOut == 0)                    revert ZeroAmount();
+        if (amountInMaximum == 0)              revert ZeroAmount();
+        if (amountInMaximum <= amountOut)      revert ZeroAmount();
+        if (recipient == address(0))           revert ZeroAddress();
 
         uint256 dl = _resolveDeadline(deadline);
 
-        // [CRITICAL-1 FIX] Compute fee once, reuse — no double-fee on received
+        // Fee computed once on amountInMaximum — no double-calc
         uint256 feeOnMax     = _calcFee(amountInMaximum);
         uint256 grossMaximum = amountInMaximum + feeOnMax;
 
-        // Pull grossMaximum; verify no excess shortfall from FOT tokens
         uint256 received = _safeTransferFrom(tokenIn, msg.sender, address(this), grossMaximum);
-        // received should equal grossMaximum for standard tokens.
-        // For FOT tokens the shortfall reduces netMax proportionally.
-        // feeAmt is recomputed from received to stay consistent.
-        uint256 feeAmt = (received * feeOnMax) / grossMaximum; // proportional fee, not double-calc
+
+        // Proportional fee on received (handles FOT shortfall consistently)
+        uint256 feeAmt = (received * feeOnMax) / grossMaximum;
         uint256 netMax = received - feeAmt;
+
+        // [HIGH-3] FOT token incompatibility: if netMax < amountOut the router
+        // will always revert — surface a clear error instead.
+        if (netMax < amountOut) revert FOTIncompatible();
 
         if (feeAmt > 0) _safeTransfer(tokenIn, feeRecipient, feeAmt);
 
@@ -431,29 +456,33 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
 
         _resetRouterAllowance(tokenIn);
 
-        // Refund unspent (netMax - amountIn) to caller
+        // Refund unspent (netMax - amountIn) to recipient
         uint256 unspent = netMax - amountIn;
-        if (unspent > 0) _safeTransfer(tokenIn, msg.sender, unspent);
+        if (unspent > 0) _safeTransfer(tokenIn, recipient, unspent);
 
-        // [CRITICAL-1 FIX] gross cost = actual router spend + fee (true user cost)
-        emit SwapExecuted(msg.sender, tokenIn, tokenOut, amountIn + feeAmt, amountOut, feeAmt, recipient);
+        // grossAmountIn = actual non-refunded tokenIn cost
+        uint256 grossIn = received - unspent;
+        emit SwapExecuted(
+            msg.sender, tokenIn, tokenOut,
+            grossIn, amountOut, feeAmt, recipient
+        );
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  VIEW: QUOTE HELPERS  (eth_call only)
+    //  QUOTE HELPERS  (EOA callers only — NOT for on-chain contract logic)
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * @notice Simulate a single-hop swap off-chain before submitting swapSingleHop().
+     * @notice Simulate single-hop swap to compute amountOutMinimum.
+     *         Call via eth_call before submitting swapSingleHop().
      *
-     * @dev This function is NOT view — QuoterV2 simulates a full swap and reverts
-     *      internally to return results. Always call via eth_call, never on-chain.
-     *      Fee is deducted before quoting so minOut is accurate for the net swap.
+     * @dev NOT a view function — QuoterV2 simulates a full swap internally.
+     *      [INFO-3] Reverts ContractCallerNotAllowed() when called by a contract.
      *
      * @param slippageBps 0 = use defaultSlippageBps
-     * @return expectedOut Raw pool output on netIn
+     * @return expectedOut Pool output on net amountIn (after fee)
      * @return minOut      Pass this as amountOutMinimum to swapSingleHop()
-     * @return feeAmt      Protocol fee that will be deducted
+     * @return feeAmt      Protocol fee that will be deducted from amountIn
      */
     function quoteSingleHop(
         address tokenIn,
@@ -461,7 +490,7 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         uint24  fee,
         uint256 amountIn,
         uint256 slippageBps
-    ) external returns (uint256 expectedOut, uint256 minOut, uint256 feeAmt) {
+    ) external noContractCallers returns (uint256 expectedOut, uint256 minOut, uint256 feeAmt) {
         uint256 slip = slippageBps == 0 ? defaultSlippageBps : slippageBps;
         feeAmt = _calcFee(amountIn);
         (expectedOut,,,) = IPancakeV3QuoterV2(quoter).quoteExactInputSingle(
@@ -471,50 +500,53 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     }
 
     /**
-     * @notice Simulate a multi-hop swap off-chain before submitting swapMultiHop().
+     * @notice Simulate multi-hop swap to compute amountOutMinimum.
+     *         Call via eth_call before submitting swapMultiHop().
      *
-     * @dev NOT view — call via eth_call only. See quoteSingleHop() dev note.
+     * @dev NOT a view function. [INFO-3] Reverts ContractCallerNotAllowed() from contracts.
      *
      * @param slippageBps 0 = use defaultSlippageBps
-     * @return expectedOut Raw pool output
+     * @return expectedOut Pool output on net amountIn (after fee)
      * @return minOut      Pass this as amountOutMinimum to swapMultiHop()
-     * @return feeAmt      Protocol fee that will be deducted
+     * @return feeAmt      Protocol fee deducted
      */
     function quoteMultiHop(
         bytes   calldata path,
         uint256 amountIn,
         uint256 slippageBps
-    ) external returns (uint256 expectedOut, uint256 minOut, uint256 feeAmt) {
+    ) external noContractCallers returns (uint256 expectedOut, uint256 minOut, uint256 feeAmt) {
         uint256 slip = slippageBps == 0 ? defaultSlippageBps : slippageBps;
         feeAmt = _calcFee(amountIn);
-        (expectedOut,,,) = IPancakeV3QuoterV2(quoter).quoteExactInput(path, amountIn - feeAmt);
+        (expectedOut,,,) = IPancakeV3QuoterV2(quoter).quoteExactInput(
+            path, amountIn - feeAmt
+        );
         minOut = _applySlippage(expectedOut, slip);
     }
 
     /**
-     * @notice Compute total tokenIn to approve before calling swapExactOutput().
-     *         [LOW-2 FIX] Consistent with swapExactOutput — fee computed once on amountInMaximum.
-     *
-     * @return grossMaximum Approve this amount to the Swapper contract
-     * @return feeAmt       Protocol fee component
+     * @notice Compute grossMaximum to approve before calling swapExactOutput().
+     * @return grossMaximum Approve this exact amount to the Swapper contract
+     * @return feeAmt       Protocol fee component (taken upfront)
      */
     function quoteExactOutputBudget(
         uint256 amountInMaximum
     ) external view returns (uint256 grossMaximum, uint256 feeAmt) {
-        feeAmt       = _calcFee(amountInMaximum);       // computed once on amountInMaximum
-        grossMaximum = amountInMaximum + feeAmt;        // no double-calc
+        feeAmt       = _calcFee(amountInMaximum);
+        grossMaximum = amountInMaximum + feeAmt;
     }
 
     // ══════════════════════════════════════════════════════════════
     //  OWNER: CIRCUIT BREAKER
     // ══════════════════════════════════════════════════════════════
 
-    function pause() external onlyOwner {
+    /// @notice Halt all swaps. [INFO-2] nonReentrant added.
+    function pause() external onlyOwner nonReentrant {
         paused = true;
         emit Paused(msg.sender);
     }
 
-    function unpause() external onlyOwner {
+    /// @notice Resume swaps. [INFO-2] nonReentrant added.
+    function unpause() external onlyOwner nonReentrant {
         paused = false;
         emit Unpaused(msg.sender);
     }
@@ -523,20 +555,18 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     //  OWNER: TWO-STEP OWNERSHIP
     // ══════════════════════════════════════════════════════════════
 
-    /**
-     * @notice Step 1 — nominate a new owner.
-     *         [MEDIUM-3] Emits OwnershipTransferCancelled if overwriting an existing pending.
-     */
+    /// @notice Step 1: nominate a new owner.
+    ///         Emits OwnershipTransferCancelled if overwriting an existing pending.
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         if (pendingOwner != address(0)) {
-            emit OwnershipTransferCancelled(pendingOwner); // [MEDIUM-3]
+            emit OwnershipTransferCancelled(pendingOwner);
         }
         pendingOwner = newOwner;
         emit OwnershipTransferInitiated(owner, newOwner);
     }
 
-    /// @notice Step 2 — pending owner accepts.
+    /// @notice Step 2: pending owner accepts.
     function acceptOwnership() external {
         if (msg.sender != pendingOwner) revert NotPendingOwner();
         emit OwnershipTransferred(owner, pendingOwner);
@@ -544,12 +574,10 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         pendingOwner = address(0);
     }
 
-    /**
-     * @notice Cancel a pending ownership transfer.
-     *         [MEDIUM-1] Reverts if no transfer is pending; emits cancellation event.
-     */
-    function cancelOwnershipTransfer() external onlyOwner {
-        if (pendingOwner == address(0)) revert NoPendingTransfer(); // [MEDIUM-1]
+    /// @notice Cancel a pending transfer. Callable by owner or nominated pending owner.
+    function cancelOwnershipTransfer() external {
+        if (msg.sender != owner && msg.sender != pendingOwner) revert NotOwner();
+        if (pendingOwner == address(0)) revert NoPendingTransfer();
         emit OwnershipTransferCancelled(pendingOwner);
         pendingOwner = address(0);
     }
@@ -567,8 +595,8 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     }
 
     function applyFeeChange() external onlyOwner {
-        if (!hasPendingFeeChange)                        revert NoPendingFeeChange();
-        if (block.timestamp < feeChangeAvailableAt)      revert TimelockNotElapsed();
+        if (!hasPendingFeeChange)                   revert NoPendingFeeChange();
+        if (block.timestamp < feeChangeAvailableAt) revert TimelockNotElapsed();
         uint256 oldBps       = feeBps;
         feeBps               = pendingFeeBps;
         hasPendingFeeChange  = false;
@@ -586,25 +614,25 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  OWNER: FEE RECIPIENT WITH TIMELOCK  [MEDIUM-2]
+    //  OWNER: FEE RECIPIENT WITH TIMELOCK
     // ══════════════════════════════════════════════════════════════
 
     function queueFeeRecipientChange(address newAddr) external onlyOwner {
         if (newAddr == address(0)) revert ZeroAddress();
-        pendingFeeRecipient              = newAddr;
-        feeRecipientChangeAvailableAt    = block.timestamp + FEE_TIMELOCK;
-        hasPendingFeeRecipientChange     = true;
+        pendingFeeRecipient           = newAddr;
+        feeRecipientChangeAvailableAt = block.timestamp + FEE_TIMELOCK;
+        hasPendingFeeRecipientChange  = true;
         emit FeeRecipientChangeQueued(newAddr, feeRecipientChangeAvailableAt);
     }
 
     function applyFeeRecipientChange() external onlyOwner {
-        if (!hasPendingFeeRecipientChange)                        revert NoPendingFeeRecipientChange();
-        if (block.timestamp < feeRecipientChangeAvailableAt)      revert TimelockNotElapsed();
-        address oldAddr                  = feeRecipient;
-        feeRecipient                     = pendingFeeRecipient;
-        hasPendingFeeRecipientChange     = false;
-        pendingFeeRecipient              = address(0);
-        feeRecipientChangeAvailableAt    = 0;
+        if (!hasPendingFeeRecipientChange)                   revert NoPendingFeeRecipientChange();
+        if (block.timestamp < feeRecipientChangeAvailableAt) revert TimelockNotElapsed();
+        address oldAddr               = feeRecipient;
+        feeRecipient                  = pendingFeeRecipient;
+        hasPendingFeeRecipientChange  = false;
+        pendingFeeRecipient           = address(0);
+        feeRecipientChangeAvailableAt = 0;
         emit FeeRecipientChangeApplied(oldAddr, feeRecipient);
     }
 
@@ -620,31 +648,37 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     //  OWNER: SWAP CONFIG
     // ══════════════════════════════════════════════════════════════
 
-    /// @notice [LOW-3] Deadline buffer capped at MAX_DEADLINE_BUFFER (1 hour).
+    /// @notice Set deadline buffer. Capped at MAX_DEADLINE_BUFFER (1 hour).
     function setDeadlineBuffer(uint256 secs) external onlyOwner {
+        if (secs == 0) revert ZeroAmount();
         if (secs > MAX_DEADLINE_BUFFER) revert DeadlineBufferTooLarge();
         emit DeadlineBufferUpdated(defaultDeadlineBuffer, secs);
         defaultDeadlineBuffer = secs;
     }
 
-    /// @notice [HIGH-2] Reverts if bps == 0 — zero slippage disables sandwich protection.
+    /// @notice Set default slippage. Cannot be zero.
     function setDefaultSlippage(uint256 bps) external onlyOwner {
-        if (bps == 0) revert SlippageNotSet();
+        if (bps < MIN_SLIPPAGE_BPS) revert SlippageTooLow();
         emit SlippageUpdated(defaultSlippageBps, bps);
         defaultSlippageBps = bps;
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  OWNER: TOKEN RESCUE WITH TIMELOCK  [HIGH-1]
+    //  OWNER: TOKEN RESCUE WITH TIMELOCK
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * @notice Step 1 — queue a rescue. Executable after RESCUE_DELAY (24h).
-     * @dev Blocks if the token still has a live router allowance (swap in-flight).
+     * @notice Step 1: queue a rescue. Executable after RESCUE_DELAY (3 days).
+     * @dev Defense-in-depth: also blocks if router allowance is live.
+     *      Primary protection is time alone — the 3-day delay is > FEE_TIMELOCK.
      */
     function queueRescue(address token, uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroAmount();
         if (IERC20(token).allowance(address(this), router) != 0)
             revert RouterAllowanceNotZero();
+        if (hasPendingRescue[token]) {
+            emit RescueCancelled(token, rescueAmount[token]);
+        }
         rescueAvailableAt[token] = block.timestamp + RESCUE_DELAY;
         rescueAmount[token]      = amount;
         hasPendingRescue[token]  = true;
@@ -652,29 +686,37 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     }
 
     /**
-     * @notice Step 2 — execute rescue after timelock has elapsed.
-     *         [INFO-1] nonReentrant added.
+     * @notice Step 2: execute rescue after timelock.
+     *         [HIGH-1] Caps amount to actual balance — stale queued amounts handled.
+     *         [INFO-1] nonReentrant.
      */
     function executeRescue(address token) external onlyOwner nonReentrant {
-        if (!hasPendingRescue[token])                       revert NoPendingRescue();
-        if (block.timestamp < rescueAvailableAt[token])     revert TimelockNotElapsed();
+        if (!hasPendingRescue[token])                   revert NoPendingRescue();
+        if (block.timestamp < rescueAvailableAt[token]) revert TimelockNotElapsed();
         if (IERC20(token).allowance(address(this), router) != 0)
             revert RouterAllowanceNotZero();
-        uint256 amount           = rescueAmount[token];
+
+        // [HIGH-1] cap to actual balance — queued amount may be stale
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal == 0) revert InsufficientBalance();
+        uint256 amount = rescueAmount[token] > bal ? bal : rescueAmount[token];
+
         hasPendingRescue[token]  = false;
         rescueAmount[token]      = 0;
         rescueAvailableAt[token] = 0;
+
         _safeTransfer(token, owner, amount);
         emit RescueExecuted(token, amount);
     }
 
-    /// @notice Cancel a queued rescue.
+    /// @notice Cancel a queued rescue. [LOW-1] emits amount in event.
     function cancelRescue(address token) external onlyOwner {
         if (!hasPendingRescue[token]) revert NoPendingRescue();
+        uint256 amount           = rescueAmount[token];
         hasPendingRescue[token]  = false;
         rescueAmount[token]      = 0;
         rescueAvailableAt[token] = 0;
-        emit RescueCancelled(token);
+        emit RescueCancelled(token, amount); // [LOW-1] amount included
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -696,16 +738,19 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
     }
 
     function _approveRouter(address token, uint256 amount) internal {
-        IERC20(token).approve(router, 0);
-        IERC20(token).approve(router, amount);
+        if (IERC20(token).allowance(address(this), router) > 0) {
+            _safeApprove(token, router, 0);
+        }
+        _safeApprove(token, router, amount);
     }
 
     function _resetRouterAllowance(address token) internal {
         if (IERC20(token).allowance(address(this), router) > 0) {
-            IERC20(token).approve(router, 0);
+            _safeApprove(token, router, 0);
         }
     }
 
+    /// @dev Returns actual received delta — handles FOT tokens correctly.
     function _safeTransferFrom(
         address token,
         address from,
@@ -713,29 +758,30 @@ contract PancakeSwapV3Swapper is ReentrancyGuard {
         uint256 amount
     ) internal returns (uint256 received) {
         uint256 balBefore = IERC20(token).balanceOf(to);
-        bool ok = IERC20(token).transferFrom(from, to, amount);
-        if (!ok) revert TransferFailed();
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
+        );
+        if (!success || (data.length > 0 && !abi.decode(data, (bool)))) revert TransferFailed();
         received = IERC20(token).balanceOf(to) - balBefore;
         if (received == 0) revert TransferFailed();
     }
 
     function _safeTransfer(address token, address to, uint256 amount) internal {
         if (amount == 0) return;
-        bool ok = IERC20(token).transfer(to, amount);
-        if (!ok) revert TransferFailed();
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
+        );
+        if (!success || (data.length > 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
-    /**
-     * @dev [LOW-1] Pure-Solidity tokenOut decode from packed path.
-     *      Path format: addr(20) + fee(3) + [addr(20) + fee(3)]* + addr(20)
-     *      Last 20 bytes = tokenOut. Uses abi.decode on a bytes slice — no assembly.
-     */
-    function _decodeTokenOut(bytes calldata path) internal pure returns (address tokenOut) {
-        bytes memory last20 = path[path.length - 20 : path.length];
-        tokenOut = abi.decode(abi.encodePacked(new bytes(12), last20), (address));
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.approve.selector, spender, amount)
+        );
+        if (!success || (data.length > 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
-    // ── Reject accidental BNB ───────────────────────────────────────
+    // ── Reject accidental BNB ─────────────────────────────────────
     receive()  external payable { revert("No BNB"); }
     fallback() external payable { revert("No BNB"); }
 }

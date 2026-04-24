@@ -1,6 +1,6 @@
 # PancakeSwapV3Swapper
 
-A production-grade smart contract for swapping ERC-20 tokens directly through PancakeSwap V3 on BSC — without visiting the PancakeSwap UI. Supports auto-slippage via QuoterV2, multi-hop routing, protocol fee collection, configurable deadlines, and an emergency pause circuit breaker.
+A production-grade smart contract for swapping ERC-20 tokens directly through PancakeSwap V3 on BSC — without visiting the PancakeSwap UI. Supports quote-assisted slippage checks via QuoterV2, multi-hop routing, protocol fee collection, configurable deadlines, and an emergency pause circuit breaker.
 
 ---
 
@@ -16,7 +16,7 @@ A production-grade smart contract for swapping ERC-20 tokens directly through Pa
 ## Features
 
 - **Permissionless** — any wallet can call the swap functions
-- **Auto-slippage** — QuoterV2 simulates the swap onchain before execution; `amountOutMinimum` is calculated automatically
+- **Quote-assisted slippage** — QuoterV2 helpers return `amountOutMinimum`; callers pass that value into swaps
 - **Single-hop swaps** — Token A → Token B through one direct pool
 - **Multi-hop swaps** — Token A → intermediate → Token B through multiple pools
 - **Exact output swaps** — receive exactly X of token B, spend ≤ max A, leftover refunded
@@ -26,7 +26,7 @@ A production-grade smart contract for swapping ERC-20 tokens directly through Pa
 - **Emergency pause** — owner can freeze all swaps instantly
 - **Reentrancy guard** — prevents callback attacks mid-swap
 - **Safe ERC-20 handling** — USDT-safe double-approve pattern + fee-on-transfer token support
-- **Token rescue** — owner can recover any ERC-20 accidentally sent to the contract
+- **Token rescue** — owner can recover ERC-20 tokens after a 3-day timelock
 
 ---
 
@@ -95,7 +95,8 @@ const [expectedOut, minOut, feeAmt] = await swapper.quoteSingleHop(
   CAKE_ADDRESS,
   USDT_ADDRESS,
   2500,               // fee tier
-  ethers.parseEther("100")
+  ethers.parseEther("100"),
+  0                   // use default slippage
 );
 ```
 
@@ -115,9 +116,9 @@ function swapSingleHop(
     address tokenOut,
     uint24  fee,
     uint256 amountIn,
+    uint256 amountOutMinimum,
     address recipient,
-    uint256 deadline,    // 0 = use defaultDeadlineBuffer
-    uint256 slippageBps  // 0 = use defaultSlippageBps
+    uint256 deadline     // 0 = use defaultDeadlineBuffer
 ) external returns (uint256 amountOut)
 ```
 
@@ -128,9 +129,9 @@ await swapper.swapSingleHop(
   USDT,
   2500,                          // 0.25% fee tier
   ethers.parseEther("100"),      // sell 100 CAKE
+  minOut,                        // from quoteSingleHop
   recipientAddress,
-  0,                             // use default deadline
-  0                              // use default slippage
+  0                              // use default deadline
 );
 ```
 
@@ -145,9 +146,9 @@ function swapMultiHop(
     bytes   calldata path,
     address tokenIn,
     uint256 amountIn,
+    uint256 amountOutMinimum,
     address recipient,
-    uint256 deadline,
-    uint256 slippageBps
+    uint256 deadline
 ) external returns (uint256 amountOut)
 ```
 
@@ -165,8 +166,8 @@ await swapper.swapMultiHop(
   path,
   CAKE,
   ethers.parseEther("100"),
+  minOut,                        // from quoteMultiHop
   recipientAddress,
-  0,
   0
 );
 ```
@@ -175,7 +176,7 @@ await swapper.swapMultiHop(
 
 ### `swapExactOutput`
 
-Receive exactly `amountOut` of `tokenOut`. Spends ≤ `amountInMaximum`, refunds the rest.
+Receive exactly `amountOut` of `tokenOut`. Spends at most the gross budget returned by `quoteExactOutputBudget(amountInMaximum)`, and refunds unspent `tokenIn` to `recipient`.
 
 ```solidity
 function swapExactOutput(
@@ -221,14 +222,14 @@ await swapper.swapExactOutput(
 
 | Function | Description |
 |---|---|
-| `setFee(uint256 bps)` | Update protocol fee. Max 500 bps (5%). |
-| `setFeeRecipient(address)` | Change fee collection wallet. |
-| `setDeadlineBuffer(uint256 secs)` | Change default deadline window. |
+| `queueFeeChange(uint256 newBps)` / `applyFeeChange()` / `cancelFeeChange()` | Manage protocol fee changes behind a 2-day timelock. Max 500 bps (5%). |
+| `queueFeeRecipientChange(address newAddr)` / `applyFeeRecipientChange()` / `cancelFeeRecipientChange()` | Manage fee recipient changes behind a 2-day timelock. |
+| `setDeadlineBuffer(uint256 secs)` | Change default deadline window. Must be greater than zero and at most 1 hour. |
 | `setDefaultSlippage(uint256 bps)` | Change default slippage tolerance. |
 | `pause()` | Freeze all swaps immediately. |
 | `unpause()` | Resume swaps after pause. |
-| `rescueTokens(address, uint256)` | Recover ERC-20 tokens sent by mistake. |
-| `transferOwnership(address)` | Transfer all admin rights. |
+| `queueRescue(address token, uint256 amount)` / `executeRescue(address token)` / `cancelRescue(address token)` | Recover ERC-20 tokens after a 3-day timelock. |
+| `transferOwnership(address)` / `acceptOwnership()` / `cancelOwnershipTransfer()` | Two-step ownership transfer. Owner or pending owner may cancel. |
 
 ---
 
@@ -237,13 +238,13 @@ await swapper.swapExactOutput(
 | Event | Emitted when |
 |---|---|
 | `SwapExecuted` | Any swap completes successfully |
-| `FeeUpdated` | Owner changes `feeBps` |
-| `FeeRecipientUpdated` | Owner changes `feeRecipient` |
+| `FeeChangeQueued` / `FeeChangeApplied` / `FeeChangeCancelled` | Fee change lifecycle updates |
+| `FeeRecipientChangeQueued` / `FeeRecipientChangeApplied` / `FeeRecipientChangeCancelled` | Fee recipient change lifecycle updates |
 | `DeadlineBufferUpdated` | Owner changes deadline buffer |
 | `SlippageUpdated` | Owner changes default slippage |
-| `OwnershipTransferred` | Ownership is transferred |
+| `OwnershipTransferInitiated` / `OwnershipTransferCancelled` / `OwnershipTransferred` | Ownership transfer lifecycle updates |
 | `Paused` / `Unpaused` | Circuit breaker toggled |
-| `TokensRescued` | Owner rescues stuck tokens |
+| `RescueQueued` / `RescueExecuted` / `RescueCancelled` | Token rescue lifecycle updates |
 
 ---
 
@@ -256,19 +257,22 @@ await swapper.swapExactOutput(
 | `ZeroAmount()` | `amountIn` or `amountOut` is 0 |
 | `FeeTooHigh()` | Fee exceeds 500 bps |
 | `DeadlineExpired()` | Deadline is in the past |
+| `DeadlineBufferTooLarge()` | Default deadline buffer exceeds 1 hour |
 | `ContractPaused()` | Swap called while paused |
 | `InvalidPath()` | Multi-hop path is too short |
-| `TransferFailed()` | ERC-20 transfer returns false |
+| `MisalignedPath()` | Multi-hop path is not 23-byte hop aligned |
+| `TransferFailed()` | ERC-20 transfer fails or reports false |
+| `ContractCallerNotAllowed()` | A contract calls a quote helper |
 
 ---
 
 ## Security Considerations
 
-- **Slippage protection** — always set a reasonable `slippageBps`. The default (50 = 0.5%) suits most pairs; volatile or low-liquidity tokens may need higher values.
+- **Slippage protection** — quote first and pass the returned `minOut` into exact-input swaps. The default quote slippage (50 = 0.5%) suits most pairs; volatile or low-liquidity tokens may need higher values.
 - **Pool verification** — verify a V3 pool exists for your token pair and fee tier before calling. Use the PancakeSwap V3 Factory `getPool(tokenA, tokenB, fee)` — returns `address(0)` if no pool exists.
 - **Fee-on-transfer tokens** — supported via balance-delta checking, but slippage values may need to be wider to account for the token's own transfer tax.
 - **Ownership** — consider transferring ownership to a multisig after deployment.
-- **Auditing** — this contract has not been audited. Review and test thoroughly before mainnet deployment with significant funds.
+- **Quote helpers** — quote functions block contract callers to discourage on-chain integration logic, but this is not an `eth_call` detector. EOAs can still submit quote transactions.
 
 ---
 

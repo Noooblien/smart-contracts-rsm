@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { defineConfig } from "hardhat/config";
+import hardhatToolboxMochaEthers from "@nomicfoundation/hardhat-toolbox-mocha-ethers";
 
 function loadEnvFile() {
   const envPath = path.join(process.cwd(), ".env");
@@ -39,6 +40,7 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const accounts = PRIVATE_KEY ? [PRIVATE_KEY] : [];
 
 export default defineConfig({
+  plugins: [hardhatToolboxMochaEthers],
   solidity: {
     version: "0.8.20",
     settings: {
@@ -64,6 +66,11 @@ export default defineConfig({
       url: process.env.BSC_MAINNET_RPC_URL || "https://bsc-dataseed.binance.org",
       chainId: 56,
       accounts,
+    },
+  },
+  test: {
+    mocha: {
+      timeout: 40_000,
     },
   },
 });
